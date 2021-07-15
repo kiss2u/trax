@@ -221,10 +221,6 @@ class Agent:
       for _ in range(n_epochs_to_run):
         self._epoch += 1
         cur_time = time.time()
-        self.train_epoch()
-        supervised.trainer_lib.log(
-            'RL training took %.2f seconds.' % (time.time() - cur_time))
-        cur_time = time.time()
         avg_return = self._collect_trajectories()
         self._avg_returns.append(avg_return)
         if self._n_trajectories_per_epoch:
@@ -272,6 +268,12 @@ class Agent:
           sw.scalar('rl/n_trajectories', self.task.n_trajectories(),
                     step=self._epoch)
           sw.flush()
+
+        cur_time = time.time()
+        self.train_epoch()
+        supervised.trainer_lib.log(
+            'RL training took %.2f seconds.' % (time.time() - cur_time))
+
         if self._output_dir is not None and self._epoch == 1:
           self.save_gin(sw)
         if self._output_dir is not None:
@@ -360,8 +362,6 @@ class PolicyAgent(Agent):
     self._policy_eval_model = tl.Accelerate(
         policy_model(mode='eval'), n_devices=1)  # Not collecting stats
     self._policy_eval_model.init(shapes.signature(policy_batch))
-    if self._task._initial_trajectories == 0:
-      self._collect_trajectories()
 
   @property
   def policy_loss(self):
@@ -383,10 +383,10 @@ class PolicyAgent(Agent):
       model = self._policy_eval_model
       model.state = self._policy_collect_model.state
     model.replicate_weights(self._policy_trainer.model_weights)
-    tr_slice = trajectory[-self._max_slice_length:]
+    tr_slice = trajectory.suffix(self._max_slice_length)
     trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
     # Add batch dimension to trajectory_np and run the model.
-    pred = model(trajectory_np.observations[None, ...])
+    pred = model(trajectory_np.observation[None, ...])
     # Pick element 0 from the batch (the only one), last (current) timestep.
     pred = pred[0, -1, :]
     sample = self._policy_dist.sample(pred, temperature=temperature)
@@ -442,24 +442,42 @@ def remaining_evals(cur_step, epoch, train_steps_per_epoch, evals_per_epoch):
   return evals_per_epoch - (done_steps_this_epoch // train_steps_per_eval)
 
 
-class PolicyGradient(Agent):
-  """Trains a policy model using policy gradient on the given RLTask."""
+class LoopPolicyAgent(Agent):
+  """Base class for policy-only Agents based on Loop."""
 
   def __init__(
-      self, task, model_fn,
+      self,
+      task,
+      model_fn,
+      value_fn,
+      weight_fn,
+      n_replay_epochs,
+      n_train_steps_per_epoch,
+      advantage_normalization,
       optimizer=adam.Adam,
       lr_schedule=lr.multifactor,
       batch_size=64,
       network_eval_at=None,
       n_eval_batches=1,
       max_slice_length=1,
+      trajectory_stream_preprocessing_fn=None,
       **kwargs
   ):
-    """Initializes PolicyGradient.
+    """Initializes LoopPolicyAgent.
 
     Args:
       task: Instance of trax.rl.task.RLTask.
       model_fn: Function (policy_distribution, mode) -> policy_model.
+      value_fn: Function TimeStepBatch -> array (batch_size, seq_len)
+        calculating the baseline for advantage calculation.
+      weight_fn: Function float -> float to apply to advantages when calculating
+        policy loss.
+      n_replay_epochs: Number of last epochs to take into the replay buffer;
+        only makes sense for off-policy algorithms.
+      n_train_steps_per_epoch: Number of steps to train the policy network for
+        in each epoch.
+      advantage_normalization: Whether to normalize the advantages before
+        passing them to weight_fn.
       optimizer: Optimizer for network training.
       lr_schedule: Learning rate schedule for network training.
       batch_size: Batch size for network training.
@@ -467,16 +485,21 @@ class PolicyGradient(Agent):
         network evaluation should be performed.
       n_eval_batches: Number of batches to run during network evaluation.
       max_slice_length: The length of trajectory slices to run the network on.
+      trajectory_stream_preprocessing_fn: Function to apply to the trajectory
+        stream before batching. Can be used e.g. to filter trajectories.
       **kwargs: Keyword arguments passed to the superclass.
     """
+    self._n_train_steps_per_epoch = n_train_steps_per_epoch
     super().__init__(task, **kwargs)
 
+    task.set_n_replay_epochs(n_replay_epochs)
     self._max_slice_length = max_slice_length
     trajectory_batch_stream = task.trajectory_batch_stream(
         batch_size,
-        epochs=[-1],
+        epochs=[-(ep + 1) for ep in range(n_replay_epochs)],
         max_slice_length=self._max_slice_length,
         sample_trajectories_uniformly=True,
+        trajectory_stream_preprocessing_fn=trajectory_stream_preprocessing_fn,
     )
     self._policy_dist = distributions.create_distribution(task.action_space)
     train_task = policy_tasks.PolicyTrainTask(
@@ -484,10 +507,12 @@ class PolicyGradient(Agent):
         optimizer(),
         lr_schedule(),
         self._policy_dist,
-        # Policy gradient uses the MC estimator. No need for margin - the MC
-        # estimator only uses empirical returns.
+        # Without a value network it doesn't make a lot of sense to use
+        # a better advantage estimator than MC.
         advantage_estimator=advantages.monte_carlo(task.gamma, margin=0),
-        value_fn=self._value_fn,
+        advantage_normalization=advantage_normalization,
+        value_fn=value_fn,
+        weight_fn=weight_fn,
     )
     eval_task = policy_tasks.PolicyEvalTask(train_task, n_eval_batches)
     model_fn = functools.partial(
@@ -499,8 +524,8 @@ class PolicyGradient(Agent):
       policy_output_dir = os.path.join(self._output_dir, 'policy')
     else:
       policy_output_dir = None
-    # Checkpoint every epoch. We do one step per epoch, so that's every step.
-    checkpoint_at = lambda _: True
+    # Checkpoint every epoch.
+    checkpoint_at = lambda step: step % n_train_steps_per_epoch == 0
     self._loop = supervised.training.Loop(
         model=model_fn(mode='train'),
         tasks=[train_task],
@@ -513,14 +538,14 @@ class PolicyGradient(Agent):
     self._collect_model = model_fn(mode='collect')
     self._collect_model.init(shapes.signature(train_task.sample_batch))
 
-    # Validate the restored checkpoints. The number of network training steps
-    # (self.loop.step) should be equal to the number of epochs (self._epoch),
-    # because we do exactly one gradient step per epoch.
+    # Validate the restored checkpoints.
     # TODO(pkozakowski): Move this to the base class once all Agents use Loop.
-    if self.loop.step != self._epoch:
+    if self._loop.step != self._epoch * self._n_train_steps_per_epoch:
       raise ValueError(
-          'The number of Loop steps must equal the number of Agent epochs, '
-          'got {} and {}.'.format(self.loop.step, self._epoch)
+          'The number of Loop steps must equal the number of Agent epochs '
+          'times the number of steps per epoch, got {}, {} and {}.'.format(
+              self._loop.step, self._epoch, self._n_train_steps_per_epoch
+          )
       )
 
   @property
@@ -528,9 +553,44 @@ class PolicyGradient(Agent):
     """Loop exposed for testing."""
     return self._loop
 
+  def train_epoch(self):
+    """Trains RL for one epoch."""
+    # Copy policy state accumulated during data collection to the trainer.
+    self._loop.update_weights_and_state(state=self._collect_model.state)
+    # Train for the specified number of steps.
+    self._loop.run(n_steps=self._n_train_steps_per_epoch)
+
+
+class PolicyGradient(LoopPolicyAgent):
+  """Trains a policy model using policy gradient on the given RLTask."""
+
+  def __init__(self, task, model_fn, **kwargs):
+    """Initializes PolicyGradient.
+
+    Args:
+      task: Instance of trax.rl.task.RLTask.
+      model_fn: Function (policy_distribution, mode) -> policy_model.
+      **kwargs: Keyword arguments passed to the superclass.
+    """
+    super().__init__(
+        task, model_fn,
+        # We're on-policy, so we can only use data from the last epoch.
+        n_replay_epochs=1,
+        # Each gradient computation needs a new data sample, so we do 1 step
+        # per epoch.
+        n_train_steps_per_epoch=1,
+        # Very simple baseline: mean return across trajectories.
+        value_fn=self._value_fn,
+        # Weights are just advantages.
+        weight_fn=(lambda x: x),
+        # Normalize advantages, because this makes optimization nicer.
+        advantage_normalization=True,
+        **kwargs
+    )
+
   def policy(self, trajectory, temperature=1.0):
-    """Policy function that allows to play using this agent."""
-    tr_slice = trajectory[-self._max_slice_length:]
+    """Policy function that samples from the trained network."""
+    tr_slice = trajectory.suffix(self._max_slice_length)
     trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
     return network_policy(
         collect_model=self._collect_model,
@@ -540,19 +600,112 @@ class PolicyGradient(Agent):
         temperature=temperature,
     )
 
-  def train_epoch(self):
-    """Trains RL for one epoch."""
-    # Copy policy state accumulated during data collection to the trainer.
-    self._loop.update_weights_and_state(state=self._collect_model.state)
-    # Perform one gradient step per training epoch to ensure we stay on policy.
-    self._loop.run(n_steps=1)
-
   @staticmethod
   def _value_fn(trajectory_batch):
     # Estimate the value of every state as the mean return across trajectories
     # and timesteps in a batch.
-    value = np.mean(trajectory_batch.returns)
-    return np.broadcast_to(value, trajectory_batch.returns.shape)
+    value = np.mean(trajectory_batch.return_)
+    return np.broadcast_to(value, trajectory_batch.return_.shape)
+
+
+@gin.configurable
+def sharpened_network_policy(
+    temperature,
+    temperature_multiplier=1.0,
+    **kwargs
+):
+  """Expert function that runs a policy network with lower temperature.
+
+  Args:
+    temperature: Temperature passed from the Agent.
+    temperature_multiplier: Multiplier to apply to the temperature to "sharpen"
+      the policy distribution. Should be <= 1, but this is not a requirement.
+    **kwargs: Keyword arguments passed to network_policy.
+
+  Returns:
+    Pair (action, dist_inputs) where action is the action taken and dist_inputs
+    is the parameters of the policy distribution, that will later be used for
+    training.
+  """
+  return network_policy(
+      temperature=(temperature_multiplier * temperature),
+      **kwargs
+  )
+
+
+class ExpertIteration(LoopPolicyAgent):
+  """Trains a policy model using expert iteration with a given expert."""
+
+  def __init__(
+      self, task, model_fn,
+      expert_policy_fn=sharpened_network_policy,
+      quantile=0.9,
+      n_replay_epochs=10,
+      n_train_steps_per_epoch=1000,
+      filter_buffer_size=256,
+      **kwargs
+  ):
+    """Initializes ExpertIteration.
+
+    Args:
+      task: Instance of trax.rl.task.RLTask.
+      model_fn: Function (policy_distribution, mode) -> policy_model.
+      expert_policy_fn: Function of the same signature as `network_policy`, to
+        be used as an expert. The policy will be trained to mimic the expert on
+        the "solved" trajectories.
+      quantile: Quantile of best trajectories to be marked as "solved". They
+        will be used to train the policy.
+      n_replay_epochs: Number of last epochs to include in the replay buffer.
+      n_train_steps_per_epoch: Number of policy training steps to run in each
+        epoch.
+      filter_buffer_size: Number of trajectories in the trajectory filter
+        buffer, used to select the best trajectories based on the quantile.
+      **kwargs: Keyword arguments passed to the superclass.
+    """
+    self._expert_policy_fn = expert_policy_fn
+    self._quantile = quantile
+    self._filter_buffer_size = filter_buffer_size
+    super().__init__(
+        task, model_fn,
+        # Don't use a baseline - it's not useful in our weights.
+        value_fn=(lambda batch: jnp.zeros_like(batch.return_)),
+        # Don't weight trajectories - the training signal is provided by
+        # filtering trajectories.
+        weight_fn=jnp.ones_like,
+        # Filter trajectories based on the quantile.
+        trajectory_stream_preprocessing_fn=self._filter_trajectories,
+        # Advantage normalization is a no-op here.
+        advantage_normalization=False,
+        n_replay_epochs=n_replay_epochs,
+        n_train_steps_per_epoch=n_train_steps_per_epoch,
+        **kwargs
+    )
+
+  def policy(self, trajectory, temperature=1.0):
+    """Policy function that runs the expert."""
+    tr_slice = trajectory.suffix(self._max_slice_length)
+    trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
+    return self._expert_policy_fn(
+        collect_model=self._collect_model,
+        policy_distribution=self._policy_dist,
+        loop=self.loop,
+        trajectory_np=trajectory_np,
+        temperature=temperature,
+    )
+
+  def _filter_trajectories(self, trajectory_stream):
+    """Filter trajectories based on the quantile."""
+    def trajectory_return(trajectory):
+      return trajectory.timesteps[0].return_
+
+    trajectory_buffer = []
+    for trajectory in trajectory_stream:
+      trajectory_buffer.append(trajectory)
+      if len(trajectory_buffer) == self._filter_buffer_size:
+        n_best = int((1 - self._quantile) * self._filter_buffer_size) or 1
+        trajectory_buffer.sort(key=trajectory_return, reverse=True)
+        yield from trajectory_buffer[:n_best]
+        trajectory_buffer.clear()
 
 
 def network_policy(
@@ -571,7 +724,7 @@ def network_policy(
     collect_model: the model used for collecting trajectories
     policy_distribution: an instance of trax.rl.distributions.Distribution
     loop: trax.supervised.training.Loop used to train the policy network
-    trajectory_np: an instance of trax.rl.task.TrajectoryNp
+    trajectory_np: an instance of trax.rl.task.TimeStepBatch
     head_index: index of the policy head a multihead model.
     temperature: temperature used to sample from the policy (default=1.0)
 
@@ -595,12 +748,12 @@ def network_policy(
   acc = loop._trainer_per_task[0].accelerated_model_with_loss  # pylint: disable=protected-access
   model.weights = acc._unreplicate(acc.weights[0])  # pylint: disable=protected-access
   # Add batch dimension to trajectory_np and run the model.
-  pred = model(trajectory_np.observations[None, ...])
+  pred = model(trajectory_np.observation[None, ...])
   if isinstance(pred, (tuple, list)):
     # For multihead models, extract the policy head output.
     pred = pred[head_index]
   assert pred.shape == (
-      1, trajectory_np.observations.shape[0], policy_distribution.n_inputs
+      1, trajectory_np.observation.shape[0], policy_distribution.n_inputs
   )
   # Pick element 0 from the batch (the only one), last (current) timestep.
   pred = pred[0, -1, :]
@@ -736,8 +889,6 @@ class ValueAgent(Agent):
     self._eval_model = tl.Accelerate(
         value_model(mode='collect'), n_devices=1)
     self._eval_model.init(shapes.signature(value_batch))
-    if self._task._initial_trajectories == 0:
-      self._collect_trajectories()
 
   @property
   def _value_model_signature(self):
@@ -889,10 +1040,10 @@ class DQN(ValueAgent):
         epochs=self._replay_epochs,
     ):
       values_target = self._run_value_model(
-          np_trajectory.observations, use_eval_model=True)
+          np_trajectory.observation, use_eval_model=True)
       if self._double_dqn:
         values = self._run_value_model(
-            np_trajectory.observations, use_eval_model=False
+            np_trajectory.observation, use_eval_model=False
         )
         index_max = np.argmax(values, axis=-1)
         ind_0, ind_1 = np.indices(index_max.shape)
@@ -909,22 +1060,23 @@ class DQN(ValueAgent):
       # is the same as values_max[:, :-1].
       n_step_returns = values_max[:, :-self._margin] + \
           self._advantage_estimator(
-              rewards=np_trajectory.rewards,
-              returns=np_trajectory.returns,
+              rewards=np_trajectory.reward,
+              returns=np_trajectory.return_,
               values=values_max,
-              dones=np_trajectory.dones
-              )
+              dones=np_trajectory.done,
+              discount_mask=np_trajectory.env_info.discount_mask,
+          )
 
       length = n_step_returns.shape[1]
       target_returns = n_step_returns[:, :length]
-      inputs = np_trajectory.observations[:, :length, :]
+      inputs = np_trajectory.observation[:, :length, :]
 
       yield (
           # Inputs are observations
           # (batch, length, obs)
           inputs,
           # the max indices will be needed to compute the loss
-          np_trajectory.actions[:, :length],  # index_max,
+          np_trajectory.action[:, :length],  # index_max,
           # Targets: computed returns.
           # target_returns, we expect here shapes such as
           # (batch, length, num_actions)
@@ -937,10 +1089,10 @@ class DQN(ValueAgent):
 
   def policy(self, trajectory, temperature=1):
     """Chooses an action to play after a trajectory."""
-    tr_slice = trajectory[-self._max_slice_length:]
+    tr_slice = trajectory.suffix(self._max_slice_length)
     trajectory_np = tr_slice.to_np(timestep_to_np=self.task.timestep_to_np)
     # Add batch dimension to trajectory_np and run the model.
-    obs = trajectory_np.observations[None, ...]
+    obs = trajectory_np.observation[None, ...]
     values = self._run_value_model(obs, use_eval_model=False)
     # We insisit that values and observations have the shape
     # (batch, length, ...), where the length is the number of subsequent

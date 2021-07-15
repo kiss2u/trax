@@ -40,6 +40,9 @@ _tf_nn_APIs = {1: [tf.nn.conv1d, tf.nn.conv1d_transpose],
                3: [tf.nn.conv3d, tf.nn.conv3d_transpose]}
 
 
+remat = tf.recompute_grad
+
+
 def most_precise_int_dtype(x):
   if not isinstance(x, six.integer_types) or isinstance(x, bool):
     return None
@@ -113,7 +116,15 @@ def _tf_to_np(inp):
 
 
 def stop_gradient(x):
-  return _tf_to_np(tf.nest.map_structure(tf.stop_gradient, x))
+
+  def static_stop_gradient(x):
+    # `tf.stop_gradient` is a no-op for non-Tensor. Returning the original type
+    # allows it to be used in the conditional without Autograph, if static. For
+    # example:
+    # `if fastmath.stop_gradient(5) > 4:`
+    return tf.stop_gradient(x) if tf.is_tensor(x) else x
+
+  return _tf_to_np(tf.nest.map_structure(static_stop_gradient, x))
 
 
 def custom_grad(f_vjp, f_original=None):
@@ -1060,8 +1071,8 @@ def scan(f, init, xs, length=None, reverse=False):
     raise ValueError(
         "Can't determine length. Please set the `length` argument.")
   xs_ta = tf.nest.map_structure(
-      lambda t: (tf.TensorArray(t.dtype, size=0, dynamic_size=True).unstack(t)  # pylint: disable=g-long-lambda
-                 if t is not None else None),
+      lambda t: (tf.TensorArray(t.dtype, size=length, dynamic_size=False)  # pylint: disable=g-long-lambda
+                 .unstack(t) if t is not None else None),
       xs)
   # tf.while_loop doesn't allow None in loop_vars, so we mask them.
   is_init_none = tf.nest.map_structure(lambda x: x is None, init)
@@ -1093,12 +1104,13 @@ def scan(f, init, xs, length=None, reverse=False):
   # ys_ta can't contain None because tf.while_loop doesn't allow None in
   # loop_vars.
   ys_ta = tf.nest.map_structure(
-      lambda y: tf.TensorArray(y.dtype if y is not None else tf.float32, size=0,  # pylint: disable=g-long-lambda
-                               dynamic_size=True),
+      lambda y: tf.TensorArray(y.dtype if y is not None else tf.float32,  # pylint: disable=g-long-lambda
+                               size=length, dynamic_size=False),
       ys_spec)
   safe_init = to_safe(init)
   _, safe_carry, ys_ta = tf.while_loop(
-      lambda i, *_: i < length, body, (0, safe_init, ys_ta))
+      lambda i, *_: i < length, body, (0, safe_init, ys_ta),
+      maximum_iterations=length)
   carry = from_safe(safe_carry)
   def _stack(a, spec):
     if spec is None:

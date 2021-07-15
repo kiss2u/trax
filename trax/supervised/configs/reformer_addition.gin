@@ -42,17 +42,20 @@ addition_inputs.train_length = 129
 addition_inputs.eval_min_length = 257
 addition_inputs.eval_max_length = 301
 addition_inputs.pad_to_multiple = 32
-addition_inputs.encdec = True
+addition_inputs.encdec = False  # True
 
 # Parameters for multifactor:
 # ==============================================================================
 multifactor.constant = 0.5
 multifactor.factors = 'constant * linear_warmup * rsqrt_decay'
-multifactor.warmup_steps = 4000
+multifactor.warmup_steps = 16000
 
 # Parameters for Adam:
 # ==============================================================================
 Adam.weight_decay_rate = 0.0
+Adam.b1 = 0.9
+Adam.b2 = 0.98
+Adam.eps = 2e-5
 
 # Parameters for Adafactor:
 # ==============================================================================
@@ -97,30 +100,48 @@ ReformerLM.d_ff = 512
 ReformerLM.dropout = 0.2
 ReformerLM.max_len = 2048
 ReformerLM.n_heads = 4
-ReformerLM.n_layers = 8
-ReformerLM.ff_use_sru = 2
-ReformerLM.pos_type = 'fixed-base'
+ReformerLM.n_layers = 4
+ReformerLM.ff_use_sru = 1
 ReformerLM.attention_type = @CausalAttention  # @LSHSelfAttention
 ReformerLM.vocab_size = %vocab_size
+ReformerLM.pos_type = 'fixed-base'
+# ReformerLM.pos_type = None
+# ReformerLM.pos_start_from_zero_prob = 0.5
+# ReformerLM.pos_max_offset_to_add = 300
 
-# Parameters for Reformer2:
+# Parameters for ConfigurableTransformerLM:
 # ==============================================================================
-Reformer2.d_model = 256
-Reformer2.d_ff = 512
-Reformer2.dropout = 0.3
-Reformer2.max_len = 2048
-Reformer2.n_heads = 4
-Reformer2.n_encoder_layers = 12
-Reformer2.n_decoder_layers = 4
-Reformer2.ff_use_sru = 1
-Reformer2.encoder_attention_type = @Attention
-Reformer2.encoder_decoder_attention_type = @CausalAttention
-# Reformer2.encoder_attention_type = @encoder/PureLSHSelfAttentionWrapper
-# Reformer2.encoder_decoder_attention_type = @PureLSHSelfAttentionWrapper
-Reformer2.input_vocab_size = %vocab_size
-Reformer2.pos_type = None
-Reformer2.pos_start_from_zero_prob = 0.95
-Reformer2.pos_max_offset_to_add = 300
+ConfigurableTransformerLM.d_model = 256
+ConfigurableTransformerLM.d_ff = 512
+ConfigurableTransformerLM.dropout = 0.2
+ConfigurableTransformerLM.max_len = 2048
+ConfigurableTransformerLM.n_heads = 4
+ConfigurableTransformerLM.n_layers = 4
+ConfigurableTransformerLM.ff_use_sru = 1
+ConfigurableTransformerLM.attention_type = @CausalAttention
+ConfigurableTransformerLM.vocab_size = %vocab_size
+ConfigurableTransformerLM.pos_type = None
+ConfigurableTransformerLM.pos_start_from_zero_prob = 0.05
+ConfigurableTransformerLM.pos_max_offset_to_add = 300
+
+# Parameters for ConfigurableTerraformer:
+# ==============================================================================
+ConfigurableTerraformer.d_model = 256
+ConfigurableTerraformer.d_ff = 512
+ConfigurableTerraformer.dropout = 0.3
+ConfigurableTerraformer.max_len = 2048
+ConfigurableTerraformer.n_heads = 4
+ConfigurableTerraformer.n_encoder_layers = 12
+ConfigurableTerraformer.n_decoder_layers = 4
+ConfigurableTerraformer.ff_use_sru = 1
+ConfigurableTerraformer.encoder_attention_type = @Attention
+ConfigurableTerraformer.encoder_decoder_attention_type = @CausalAttention
+# ConfigurableTerraformer.encoder_attention_type = @encoder/PureLSHSelfAttentionWrapper
+# ConfigurableTerraformer.encoder_decoder_attention_type = @PureLSHSelfAttentionWrapper
+ConfigurableTerraformer.input_vocab_size = %vocab_size
+ConfigurableTerraformer.pos_type = None
+ConfigurableTerraformer.pos_start_from_zero_prob = 0.95
+ConfigurableTerraformer.pos_max_offset_to_add = 300
 
 # Parameters for train:
 # ==============================================================================
@@ -128,6 +149,6 @@ Reformer2.pos_max_offset_to_add = 300
 train.inputs = @trax.data.addition_inputs
 train.eval_frequency = 1000
 train.eval_steps = 50
-train.optimizer = @trax.optimizers.Adafactor
+train.optimizer = @trax.optimizers.Adam
 train.steps = 300000
-train.model = @trax.models.Reformer2
+train.model = @trax.models.ConfigurableTransformerLM

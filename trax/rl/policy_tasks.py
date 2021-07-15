@@ -56,17 +56,17 @@ class PolicyTrainTask(training.TrainTask):
     """Initializes PolicyTrainTask.
 
     Args:
-      trajectory_batch_stream: Generator of trax.rl.task.TrajectoryNp.
+      trajectory_batch_stream: Generator of trax.rl.task.TimeStepBatch.
       optimizer: Optimizer for network training.
       lr_schedule: Learning rate schedule for network training.
       policy_distribution: Distribution over actions.
       advantage_estimator: Function
         (rewards, returns, values, dones) -> advantages, created by one of the
         functions from trax.rl.advantages.
-      value_fn: Function TrajectoryNp -> array (batch_size, seq_len) calculating
-        the baseline for advantage calculation. Can be used to implement
-        actor-critic algorithms, by substituting a call to the value network
-        as value_fn.
+      value_fn: Function TimeStepBatch -> array (batch_size, seq_len)
+        calculating the baseline for advantage calculation. Can be used to
+        implement actor-critic algorithms, by substituting a call to the value
+        network as value_fn.
       weight_fn: Function float -> float to apply to advantages. Examples:
         - A2C: weight_fn = id
         - AWR: weight_fn = exp
@@ -100,8 +100,8 @@ class PolicyTrainTask(training.TrainTask):
     )
 
   def calculate_advantages(self, trajectory_batch, shape_only=False):
-    (batch_size, seq_len) = trajectory_batch.observations.shape[:2]
-    assert trajectory_batch.actions.shape[:2] == (batch_size, seq_len)
+    (batch_size, seq_len) = trajectory_batch.observation.shape[:2]
+    assert trajectory_batch.action.shape[:2] == (batch_size, seq_len)
     assert trajectory_batch.mask.shape == (batch_size, seq_len)
     if shape_only:
       values = np.zeros((batch_size, seq_len))
@@ -111,10 +111,11 @@ class PolicyTrainTask(training.TrainTask):
       assert values.shape == (batch_size, seq_len)
     # Compute the advantages using the chosen advantage estimator.
     return self._advantage_estimator(
-        rewards=trajectory_batch.rewards,
-        returns=trajectory_batch.returns,
-        dones=trajectory_batch.dones,
+        rewards=trajectory_batch.reward,
+        returns=trajectory_batch.return_,
+        dones=trajectory_batch.done,
         values=values,
+        discount_mask=trajectory_batch.env_info.discount_mask,
     )
 
   def calculate_weights(self, advantages):
@@ -128,8 +129,8 @@ class PolicyTrainTask(training.TrainTask):
     assert weights.shape == advantages.shape
     return weights
 
-  def trim_batch(self, trajectory_batch, advantages):
-    (batch_size, seq_len) = trajectory_batch.observations.shape[:2]
+  def trim_and_mask_batch(self, trajectory_batch, advantages):
+    (batch_size, seq_len) = trajectory_batch.observation.shape[:2]
     adv_seq_len = advantages.shape[1]
     # The advantage sequence should be shorter by the margin. Margin is the
     # number of timesteps added to the trajectory slice, to make the advantage
@@ -142,16 +143,19 @@ class PolicyTrainTask(training.TrainTask):
     assert adv_seq_len <= seq_len
     assert advantages.shape == (batch_size, adv_seq_len)
     # Trim observations, actions and mask to match the target length.
-    observations = trajectory_batch.observations[:, :adv_seq_len]
-    actions = trajectory_batch.actions[:, :adv_seq_len]
+    observations = trajectory_batch.observation[:, :adv_seq_len]
+    actions = trajectory_batch.action[:, :adv_seq_len]
     mask = trajectory_batch.mask[:, :adv_seq_len]
+    # Apply the control mask, so we only compute policy loss for controllable
+    # timesteps.
+    mask *= trajectory_batch.env_info.control_mask[:, :adv_seq_len]
     return (observations, actions, mask)
 
   def policy_batch(self, trajectory_batch, shape_only=False):
     """Computes a policy training batch based on a trajectory batch.
 
     Args:
-      trajectory_batch: trax.rl.task.TrajectoryNp with a batch of trajectory
+      trajectory_batch: trax.rl.task.TimeStepBatch with a batch of trajectory
         slices. Elements should have shape (batch_size, seq_len, ...).
       shape_only: Whether to return dummy zero arrays of correct shape. Useful
         for initializing models.
@@ -166,7 +170,7 @@ class PolicyTrainTask(training.TrainTask):
     advantages = self.calculate_advantages(
         trajectory_batch, shape_only=shape_only
     )
-    (observations, actions, mask) = self.trim_batch(
+    (observations, actions, mask) = self.trim_and_mask_batch(
         trajectory_batch, advantages
     )
     weights = self.calculate_weights(advantages) * mask / jnp.sum(mask)
@@ -214,7 +218,7 @@ class PolicyEvalTask(training.EvalTask):
     advantages = self._train_task.calculate_advantages(
         trajectory_batch, shape_only=shape_only
     )
-    (observations, actions, mask) = self._train_task.trim_batch(
+    (observations, actions, mask) = self._train_task.trim_and_mask_batch(
         trajectory_batch, advantages
     )
     return (observations, actions, advantages, mask)

@@ -55,8 +55,8 @@ class Trainer:
     self._adasum = adasum
 
     # optimizer slots and opt_params may need to be replicated
-    self._slots, self._opt_params = tl.for_n_devices(
-        (self._optimizer.slots, self._optimizer.opt_params), self._n_devices)
+    self._slots, self._opt_params = tl.on_cpu(tl.for_n_devices(
+        (self._optimizer.slots, self._optimizer.opt_params), self._n_devices))
 
     # accelerated version of model+loss to replicate weights and state
     self._accelerated_model_with_loss = tl.Accelerate(
@@ -107,7 +107,7 @@ class Trainer:
   def slots(self, slots):
     """Sets the slots of the optimizers and this class (replicated)."""
     self._optimizer.slots = slots
-    self._slots = tl.for_n_devices(slots, self._n_devices)
+    self._slots = tl.on_cpu(tl.for_n_devices(slots, self._n_devices))
 
   def one_step(self, batch, rng, step=0, learning_rate=None):
     """Runs one training step, to update model and optimizer parameters.
@@ -172,8 +172,7 @@ def _adasum_merge(g1, g2):
 
 def _average_multidevice_gradients(gradients, adasum=False):
   """Averages gradients over all the devices across different hosts."""
-  n = jnp.array(fastmath.global_device_count() // base.N_WEIGHTS_SHARDS,
-                dtype=jnp.float32)
+  n = fastmath.global_device_count() // base.N_WEIGHTS_SHARDS
   if adasum:
     # This implements a version of the Adasum algorithm from the following
     # paper: https://arxiv.org/pdf/2006.02924.pdf
@@ -197,6 +196,7 @@ def _average_multidevice_gradients(gradients, adasum=False):
                                    axis_index_groups=groups)
   else:
     gradients_psum = fastmath.psum(gradients, 'batch')  # sum all gradients
+  n = jnp.array(n, dtype=jnp.float32)
   return fastmath.nested_map(lambda g: g / n, gradients_psum)
 
 

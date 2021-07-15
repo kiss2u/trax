@@ -14,10 +14,11 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Tests for trax.supervised.tf_inputs."""
+"""Tests for trax.data.tf_inputs."""
 
 import collections
 import os
+from unittest import mock
 
 import gin
 import numpy as np
@@ -112,47 +113,87 @@ class TFInputsTest(tf.test.TestCase):
     super().setUp()
     gin.clear_config()
 
-  def test_TFDS_default_split_is_train(self):
-    fn_that_returns_iterator = tf_inputs.TFDS('glue/mnli',
-                                              keys=('premise', 'hypothesis'),
-                                              shuffle_train=False)
-    # Given shuffle_train=False, data stream should be deterministic.
-    item_iterator = fn_that_returns_iterator()
-    premise, hypothesis = next(item_iterator)
-    self.assertEqual(premise[:30], b'In recognition of these tensio')
-    self.assertEqual(hypothesis[:30], b'Meaningful partnerships with s')
 
-  def test_TFDS_split_is_train(self):
-    fn_that_returns_iterator = tf_inputs.TFDS('glue/mnli',
-                                              keys=('premise', 'hypothesis'),
-                                              train=True,
-                                              shuffle_train=False)
-    # Given shuffle_train=False, data stream should be deterministic.
-    item_iterator = fn_that_returns_iterator()
-    premise, hypothesis = next(item_iterator)
-    self.assertEqual(premise[:30], b'In recognition of these tensio')
-    self.assertEqual(hypothesis[:30], b'Meaningful partnerships with s')
+  def test_TFDS_single_host_with_eval_holdout(self):
+    train_ds_gen = tf_inputs.TFDS(
+        'c4/en:2.3.0',
+        data_dir=_TESTDATA,
+        train=True,
+        host_id=0,
+        keys=('text',),
+        n_hosts=1,
+        eval_holdout_size=0.1)
 
-  def test_TFDS_split_is_eval(self):
-    fn_that_returns_iterator = tf_inputs.TFDS('glue/mnli',
-                                              keys=('premise', 'hypothesis'),
-                                              train=False)
-    # Given train=False, data stream should be deterministic.
-    item_iterator = fn_that_returns_iterator()  # should be deterministic
-    premise, hypothesis = next(item_iterator)
-    self.assertEqual(premise[:30], b'uh-huh oh yeah all the people ')
-    self.assertEqual(hypothesis[:30], b'yeah lots of people for the ri')
+    # Just ensure that this doesn't crash.
+    for d in train_ds_gen():
+      print(f'Train: {d}')
+      break
 
-  def test_TFDS_split_is_alt_eval(self):
-    fn_that_returns_iterator = tf_inputs.TFDS('glue/mnli',
-                                              keys=('premise', 'hypothesis'),
-                                              train=False,
-                                              use_alt_eval=True)
-    # Given train=False, data stream should be deterministic.
-    item_iterator = fn_that_returns_iterator()
-    premise, hypothesis = next(item_iterator)
-    self.assertEqual(premise[:30], b'Projects which enliven and enr')
-    self.assertEqual(hypothesis[:30], b'These projects are largely ign')
+    valid_ds_gen = tf_inputs.TFDS(
+        'c4/en:2.3.0',
+        data_dir=_TESTDATA,
+        train=False,
+        host_id=0,
+        keys=('text',),
+        n_hosts=1,
+        eval_holdout_size=0.1)
+
+    # Just ensure that this doesn't crash.
+    for d in valid_ds_gen():
+      print(f'Eval: {d}')
+      break
+
+  def test_TFDS_single_host_with_eval_holdout_no_valid_split(self):
+    train_ds_gen = tf_inputs.TFDS(
+        'para_crawl/ende',
+        data_dir=_TESTDATA,
+        train=True,
+        host_id=0,
+        keys=('en', 'de'),
+        n_hosts=1,
+        eval_holdout_size=0.1)
+
+    # Just ensure that this doesn't crash.
+    for d in train_ds_gen():
+      print(f'Train: {d}')
+      break
+
+    # para_crawl doesn't have a validation set, see that this still doesn't
+    # crash because of eval_holdout_set.
+    valid_ds_gen = tf_inputs.TFDS(
+        'para_crawl/ende',
+        data_dir=_TESTDATA,
+        train=False,
+        host_id=0,
+        keys=('en', 'de'),
+        n_hosts=1,
+        eval_holdout_size=0.1)
+
+    # Just ensure that this doesn't crash.
+    for d in valid_ds_gen():
+      print(f'Eval: {d}')
+      break
+
+  def test_TFDS_mnli_split_is_eval(self):
+    with mock.patch('tensorflow_datasets.load') as tfds_load:
+      with mock.patch('trax.data.tf_inputs.download_and_prepare',
+                      lambda _, data_dir: data_dir):
+        _ = tf_inputs.TFDS('glue/mnli',
+                           keys=('premise', 'hypothesis'),
+                           train=False)
+      call_kwargs = tfds_load.call_args[1]
+      self.assertEqual(call_kwargs['split'], 'validation_matched')
+
+  def test_TFDS_mnli_split_is_alt_eval(self):
+    with mock.patch('tensorflow_datasets.load') as tfds_load:
+      with mock.patch('trax.data.tf_inputs.download_and_prepare',
+                      lambda _, data_dir: data_dir):
+        _ = tf_inputs.TFDS('glue/mnli',
+                           keys=('premise', 'hypothesis'),
+                           train=False,
+                           use_alt_eval=True)
+      call_kwargs = tfds_load.call_args[1]
+      self.assertEqual(call_kwargs['split'], 'validation_mismatched')
 
   def test_convert_to_unicode(self):
 
@@ -798,15 +839,24 @@ class TFInputsTest(tf.test.TestCase):
     self.assertEqual(list_op, ['divide(n0,const_3)', 'sqrt(#0)'])
     self.assertEqual(list_num, [588])
 
+    # Below we execute twice the Python program and once the DSL program.
     target_values = 'import math\n'
+    problem = example['Problem']
     for i in range(len(list_num)):
       target_values += 'n{} = {}\n'.format(i, list_num[i])
+      problem += ' n{} = {}'.format(i, list_num[i])
     target_values += '\n'.join(python_program[:-1])
     final_line = python_program[-1].split('=')[1]
     target_values += '\nanswer ={}'.format(final_line)
     var_dict = {}
     exec(target_values, globals(), var_dict)  # pylint: disable=exec-used
     self.assertAllClose(var_dict['answer'], 14)
+    self.assertAllClose(
+        tf_inputs.execute_mathqa_program(problem, target_values.split('\n')),
+        14)
+    self.assertAllClose(
+        tf_inputs.execute_mathqa_dsl_program(problem,
+                                             [example['linear_formula']]), 14)
 
 
   def test_sentencepiece_tokenize(self):
